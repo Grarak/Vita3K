@@ -1529,6 +1529,13 @@ EXPORT(SceUID, sceKernelLoadModule, char *path, int flags, SceKernelLMOption *op
 
 EXPORT(SceUID, sceKernelLoadStartModule, const char *moduleFileName, SceSize args, Ptr<const void> argp, SceUInt32 flags, const SceKernelLMOption *pOpt, int *pRes) {
     TRACY_FUNC(sceKernelLoadStartModule, moduleFileName, args, argp, flags, pOpt, pRes);
+    // The runtime Cg compiler is not a firmware module and is never present; SceShaccCg is
+    // implemented here instead, and its exports resolve whether or not the PRX was loaded. So
+    // the load succeeds and the caller goes on to compile.
+    if (moduleFileName && strstr(moduleFileName, "libshacccg.suprx")) {
+        LOG_INFO("libshacccg.suprx is emulated: SceShaccCg calls are handled by Vita3K");
+        return 0x10000042;
+    }
     return CALL_EXPORT(_sceKernelLoadStartModule, moduleFileName, args, argp, flags, pOpt, pRes);
 }
 

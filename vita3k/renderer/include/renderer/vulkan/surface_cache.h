@@ -216,6 +216,11 @@ public:
     // if this call is used for a copy or similar operation set the changed address to the destination
     // so that subsequent calls to check_for_surface with the target destination also get delayed
     bool check_for_surface(MemState &mem, Address source_address, CallbackRequestFunction &callback, Address target_address);
+    // A transfer fill over the whole of a cached colour or depth-stencil surface: apply it to
+    // the GPU image too, since a CPU write to the surface's memory is otherwise never seen by
+    // the image (a guest that clears its render target through the transfer unit would keep
+    // rendering over the previous frame's depth).
+    void fill_surface(Address address, uint32_t width, uint32_t height, uint32_t bpp, uint32_t value);
 
     // If non-null, the return value must be sent as a PostSurfaceSyncRequest
     ColorSurfaceCacheInfo *perform_surface_sync();

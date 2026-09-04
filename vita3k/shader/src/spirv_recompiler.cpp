@@ -2125,7 +2125,15 @@ void convert_gxp_to_glsl_from_filepath(const std::string &shader_filepath_utf8) 
     std::fill_n(hints.vertex_textures, SCE_GXM_MAX_TEXTURE_UNITS, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR);
     std::fill_n(hints.fragment_textures, SCE_GXM_MAX_TEXTURE_UNITS, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR);
 
-    convert_gxp(*reinterpret_cast<SceGxmProgram *>(gxp_program.data()), shader_filepath_str.filename().string(), features, shader::Target::GLSLOpenGL, hints, false, true);
+    // Local patch: -s also writes the USSE disassembly next to the input as <file>.dsm.
+    const auto dumper = [&](const std::string &ext, const std::string &dump) {
+        if (ext == "dsm") {
+            std::ofstream out(shader_filepath_utf8 + ".dsm");
+            out << dump;
+        }
+        return true;
+    };
+    convert_gxp(*reinterpret_cast<SceGxmProgram *>(gxp_program.data()), shader_filepath_str.filename().string(), features, shader::Target::GLSLOpenGL, hints, false, true, dumper);
 }
 
 } // namespace shader

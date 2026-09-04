@@ -605,6 +605,22 @@ static void take_screenshot(EmuEnvState &emuenv) {
 }
 
 bool handle_events(EmuEnvState &emuenv, GuiState &gui) {
+    // Headless capture: VITA3K_AUTOSHOT gives a period in seconds on which to take a
+    // screenshot by itself, so a run driven by a script - with no keyboard to press - still
+    // produces pictures of what the emulator drew.
+    static const int autoshot = []() {
+        const char *const period = std::getenv("VITA3K_AUTOSHOT");
+        return period ? std::atoi(period) : 0;
+    }();
+    if (autoshot > 0) {
+        static auto last_shot = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_shot).count() >= autoshot) {
+            last_shot = now;
+            take_screenshot(emuenv);
+        }
+    }
+
     const auto allow_switch_state = !emuenv.io.title_id.empty() && !gui.vita_area.app_close && !gui.vita_area.home_screen && !gui.vita_area.user_management && !gui.configuration_menu.custom_settings_dialog && !gui.configuration_menu.settings_dialog && !gui.controls_menu.controls_dialog && gui::get_sys_apps_state(gui);
 
     const auto ui_navigation = [&emuenv, &gui, allow_switch_state](const uint32_t sce_ctrl_btn) {

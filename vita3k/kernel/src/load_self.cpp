@@ -608,7 +608,13 @@ SceUID load_self(KernelState &kernel, MemState &mem, const void *self, const std
                 */
 
                 if (isRelocatable) {
-                    segment_address = alloc(mem, seg_header.p_memsz, alloc_name.c_str());
+                    // Prefer the image base. A module whose relocations are incomplete - which
+                    // a homebrew toolchain can produce, and which never shows on hardware
+                    // because user modules land on their link address there - only works when
+                    // it is loaded where it was linked.
+                    segment_address = try_alloc_at(mem, seg_header.p_vaddr, seg_header.p_memsz, alloc_name.c_str());
+                    if (!segment_address)
+                        segment_address = alloc(mem, seg_header.p_memsz, alloc_name.c_str());
                 } else {
                     segment_address = alloc_at(mem, seg_header.p_vaddr, seg_header.p_memsz, alloc_name.c_str());
                 }

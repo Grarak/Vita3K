@@ -221,6 +221,9 @@ void PipelineCache::init(bool support_rasterized_order_access) {
         }
 
         state.features.support_rgb_attributes = unsupported_rgb_vertex_attribute_formats.empty();
+        LOG_INFO("Vertex attribute formats: scaled {}, 3-component {} ({} unsupported)",
+            support_scaled_vertex_attribute, state.features.support_rgb_attributes,
+            unsupported_rgb_vertex_attribute_formats.size());
     }
 
     support_coherent_framebuffer_fetch = support_rasterized_order_access;

@@ -60,8 +60,11 @@ static void perform_transfer_copy_impl(MemState &mem, const SceGxmTransferImage 
         for (uint32_t dy = 0; dy < src.height; dy++) {
             // compute offset depending on the texture type used
             // the function compute_offset gets inlined
-            uint32_t src_offset = compute_offset(src.x + dx, src.y + dy, src, src_type);
-            uint32_t dst_offset = compute_offset(dst.x + dx, dst.y + dy, dst, dst_type);
+            // Signed: a transfer may walk backwards through memory - a negative stride with the
+            // address on the last row is how a caller flips an image - and truncating that to
+            // unsigned turns the first row into a read gigabytes past the end.
+            const int32_t src_offset = compute_offset(src.x + dx, src.y + dy, src, src_type);
+            const int32_t dst_offset = compute_offset(dst.x + dx, dst.y + dy, dst, dst_type);
 
             T value = src_ptr[src_offset];
             if constexpr (mode == SCE_GXM_TRANSFER_COLORKEY_PASS) {
@@ -158,6 +161,27 @@ COMMAND(handle_transfer_copy) {
 
         // Get bits per pixel of the image
         const uint32_t bpp = gxm::get_bits_per_pixel(src.format);
+
+        // A transfer whose images are not in mapped memory would fault inside the emulator
+        // rather than in the guest, which hides the caller's mistake behind a crash.
+        // The rows a transfer touches, lowest and highest address, so a negative stride is
+        // described by the same two numbers as a positive one.
+        const auto image_span = [bpp, &src](const SceGxmTransferImage &img) {
+            const int32_t first = static_cast<int32_t>(img.y) * img.stride;
+            const int32_t last = static_cast<int32_t>(img.y + src.height - 1) * img.stride;
+            const int32_t row_bytes = static_cast<int32_t>((img.x + src.width) * bpp / 8);
+            return std::pair<Address, Address>{ img.address.address() + std::min(first, last),
+                img.address.address() + std::max(first, last) + row_bytes };
+        };
+        const auto [src_low, src_high] = image_span(src);
+        const auto [dst_low, dst_high] = image_span(dst);
+        if (!is_valid_addr_range(mem, src_low, src_high) || !is_valid_addr_range(mem, dst_low, dst_high)) {
+            LOG_ERROR("Transfer copy over unmapped memory: src {} ({}x{} @ {},{} stride {}), dst {} (@ {},{} stride {})",
+                log_hex(src.address.address()), src.width, src.height, src.x, src.y, src.stride,
+                log_hex(dst.address.address()), dst.x, dst.y, dst.stride);
+            delete[] images;
+            return;
+        }
 
         // use a specialized function for each type (more optimized)
         switch (bpp) {
@@ -307,6 +331,9 @@ COMMAND(handle_transfer_fill) {
     }
 
     // TODO: handle case where dest is a cached surface
+
+    if (renderer.current_backend == Backend::Vulkan)
+        dynamic_cast<vulkan::VKState &>(renderer).surface_cache.fill_surface(dest->address.address(), dest->width, dest->height, bpp, fill_color);
 
     delete dest;
 }

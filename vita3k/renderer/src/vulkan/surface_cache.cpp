@@ -1068,10 +1068,18 @@ bool VKSurfaceCache::check_for_surface(MemState &mem, Address source_address, Ca
         return true;
     }
 
-    // for now, only look if the address matches exactly a color surface
+    // A source at the surface's address, or anywhere inside it: a caller reading rows out of
+    // a surface (a partial download, a flipped copy starting at the last row) needs the same
+    // sync as one reading from the base.
     auto it = color_address_lookup.find(source_address);
-    if (it == color_address_lookup.end())
-        return false;
+    if (it == color_address_lookup.end()) {
+        it = std::find_if(color_address_lookup.begin(), color_address_lookup.end(), [source_address](const auto &entry) {
+            const auto &info = *entry.second;
+            return source_address > entry.first && source_address < entry.first + info.total_bytes;
+        });
+        if (it == color_address_lookup.end())
+            return false;
+    }
 
     auto &surface = *it->second;
     VKContext &context = *static_cast<VKContext *>(state.context);
@@ -1136,6 +1144,64 @@ bool VKSurfaceCache::check_for_surface(MemState &mem, Address source_address, Ca
         cpu_surfaces_changed.push_back(target_address);
 
     return true;
+}
+
+void VKSurfaceCache::fill_surface(Address address, uint32_t width, uint32_t height, uint32_t bpp, uint32_t value) {
+    vkutil::Image *image = nullptr;
+    bool is_depth = false;
+    auto color_it = color_address_lookup.find(address);
+    if (color_it != color_address_lookup.end()) {
+        ColorSurfaceCacheInfo &info = *color_it->second;
+        if (info.format != SCE_GXM_COLOR_BASE_FORMAT_U8U8U8U8 || bpp != 32 || width < info.original_width || height < info.original_height)
+            return;
+        image = &info.texture;
+    } else {
+        auto depth_it = depth_address_lookup.find(address);
+        if (depth_it == depth_address_lookup.end())
+            return;
+        DepthStencilSurfaceCacheInfo &info = *depth_it->second;
+        if (bpp != 32 || width < static_cast<uint32_t>(info.memory_width) || height < static_cast<uint32_t>(info.memory_height))
+            return;
+        image = &info.texture;
+        is_depth = true;
+    }
+    if (!image->image)
+        return;
+
+    vk::CommandBuffer cmd;
+    vk::Fence fence = state.device.createFence({});
+    {
+        std::lock_guard<std::mutex> lock(state.multithread_pool_mutex);
+        cmd = vkutil::create_single_time_command(state.device, state.multithread_command_pool);
+    }
+    const vkutil::ImageLayout previous = image->layout;
+    if (is_depth) {
+        image->transition_to(cmd, vkutil::ImageLayout::TransferDst, vkutil::ds_subresource_range);
+        // S8D24: the stencil is the high byte, the depth the low 24 bits.
+        vk::ClearDepthStencilValue clear_value{
+            .depth = static_cast<float>(value & 0xFFFFFFu) / 16777215.0f,
+            .stencil = value >> 24
+        };
+        cmd.clearDepthStencilImage(image->image, vk::ImageLayout::eTransferDstOptimal, clear_value, vkutil::ds_subresource_range);
+        image->transition_to(cmd, previous == vkutil::ImageLayout::Undefined ? vkutil::ImageLayout::DepthStencilReadOnly : previous, vkutil::ds_subresource_range);
+    } else {
+        image->transition_to(cmd, vkutil::ImageLayout::TransferDst);
+        // U8U8U8U8_ABGR: r in the low byte.
+        vk::ClearColorValue clear_color{ std::array<float, 4>({ (value & 0xFF) / 255.0f, ((value >> 8) & 0xFF) / 255.0f, ((value >> 16) & 0xFF) / 255.0f, (value >> 24) / 255.0f }) };
+        cmd.clearColorImage(image->image, vk::ImageLayout::eTransferDstOptimal, clear_color, vkutil::color_subresource_range);
+        image->transition_to(cmd, previous == vkutil::ImageLayout::Undefined ? vkutil::ImageLayout::ColorAttachmentReadWrite : previous);
+    }
+    cmd.end();
+    vk::SubmitInfo submit_info{};
+    submit_info.setCommandBuffers(cmd);
+    state.general_queue.submit(submit_info, fence);
+    if (state.device.waitForFences(fence, vk::True, std::numeric_limits<uint64_t>::max()) != vk::Result::eSuccess)
+        LOG_ERROR("Could not wait for the fill fence.");
+    state.device.destroyFence(fence);
+    {
+        std::lock_guard<std::mutex> lock(state.multithread_pool_mutex);
+        state.device.freeCommandBuffers(state.multithread_command_pool, cmd);
+    }
 }
 
 ColorSurfaceCacheInfo *VKSurfaceCache::perform_surface_sync() {

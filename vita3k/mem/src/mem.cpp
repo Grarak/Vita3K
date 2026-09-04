@@ -16,6 +16,9 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <mem/functions.h>
+#if defined(__linux__)
+#include <execinfo.h>
+#endif
 #include <mem/state.h>
 
 #include <util/align.h>
@@ -631,6 +634,16 @@ static void signal_handler(int sig, siginfo_t *info, void *uct) noexcept {
     }
 
     LOG_CRITICAL("Unhandled access to 0x{:X}", reinterpret_cast<uintptr_t>(info->si_addr));
+#if defined(__linux__)
+    {
+        void *frames[32];
+        const int count = backtrace(frames, 32);
+        char **names = backtrace_symbols(frames, count);
+        for (int i = 0; i < count; ++i)
+            LOG_CRITICAL("  #{}: {}", i, names && names[i] ? names[i] : "?");
+        std::free(names);
+    }
+#endif
     raise(SIGTRAP);
     return;
 }
