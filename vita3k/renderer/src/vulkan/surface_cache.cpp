@@ -1149,6 +1149,7 @@ bool VKSurfaceCache::check_for_surface(MemState &mem, Address source_address, Ca
 void VKSurfaceCache::fill_surface(Address address, uint32_t width, uint32_t height, uint32_t bpp, uint32_t value) {
     vkutil::Image *image = nullptr;
     bool is_depth = false;
+    SceGxmDepthStencilFormat depth_format = SCE_GXM_DEPTH_STENCIL_FORMAT_S8D24;
     auto color_it = color_address_lookup.find(address);
     if (color_it != color_address_lookup.end()) {
         ColorSurfaceCacheInfo &info = *color_it->second;
@@ -1160,7 +1161,8 @@ void VKSurfaceCache::fill_surface(Address address, uint32_t width, uint32_t heig
         if (depth_it == depth_address_lookup.end())
             return;
         DepthStencilSurfaceCacheInfo &info = *depth_it->second;
-        if (bpp != 32 || width < static_cast<uint32_t>(info.memory_width) || height < static_cast<uint32_t>(info.memory_height))
+        depth_format = info.surface.get_format();
+        if ((bpp != 32 && bpp != 16) || width < static_cast<uint32_t>(info.memory_width) || height < static_cast<uint32_t>(info.memory_height))
             return;
         image = &info.texture;
         is_depth = true;
@@ -1177,11 +1179,20 @@ void VKSurfaceCache::fill_surface(Address address, uint32_t width, uint32_t heig
     const vkutil::ImageLayout previous = image->layout;
     if (is_depth) {
         image->transition_to(cmd, vkutil::ImageLayout::TransferDst, vkutil::ds_subresource_range);
-        // S8D24: the stencil is the high byte, the depth the low 24 bits.
-        vk::ClearDepthStencilValue clear_value{
-            .depth = static_cast<float>(value & 0xFFFFFFu) / 16777215.0f,
-            .stencil = value >> 24
-        };
+        // S8D24: the stencil is the high byte, the depth the low 24 bits. D16 (a 16-bit
+        // fill): the whole word is the depth. DF32 (and its masked forms): the word is the
+        // float itself.
+        vk::ClearDepthStencilValue clear_value;
+        if (bpp == 16) {
+            clear_value = { .depth = static_cast<float>(value & 0xFFFFu) / 65535.0f, .stencil = 0 };
+        } else if (depth_format == SCE_GXM_DEPTH_STENCIL_FORMAT_DF32 || depth_format == SCE_GXM_DEPTH_STENCIL_FORMAT_DF32M
+            || depth_format == SCE_GXM_DEPTH_STENCIL_FORMAT_DF32_S8 || depth_format == SCE_GXM_DEPTH_STENCIL_FORMAT_DF32M_S8) {
+            float depth;
+            memcpy(&depth, &value, sizeof(depth));
+            clear_value = { .depth = depth, .stencil = 0 };
+        } else {
+            clear_value = { .depth = static_cast<float>(value & 0xFFFFFFu) / 16777215.0f, .stencil = value >> 24 };
+        }
         cmd.clearDepthStencilImage(image->image, vk::ImageLayout::eTransferDstOptimal, clear_value, vkutil::ds_subresource_range);
         image->transition_to(cmd, previous == vkutil::ImageLayout::Undefined ? vkutil::ImageLayout::DepthStencilReadOnly : previous, vkutil::ds_subresource_range);
     } else {

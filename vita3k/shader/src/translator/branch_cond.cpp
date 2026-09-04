@@ -263,7 +263,8 @@ spv::Id USSETranslatorVisitor::vtst_impl(Instruction inst, ExtPredicate pred, in
         index_tb_comp = 2;
     }
 
-    const spv::Op used_comp_op = tb_comp_ops[index_tb_comp][compare_include_equal][sign_test];
+    spv::Op used_comp_op = tb_comp_ops[index_tb_comp][compare_include_equal][sign_test];
+    bool signed_zero_test = false;
 
     // Optimize this case. Alternative name is CMP.
     const char *tb_comp_str[2][4] = {
@@ -309,6 +310,14 @@ spv::Id USSETranslatorVisitor::vtst_impl(Instruction inst, ExtPredicate pred, in
 
         if (is_signed_integer_data_type(load_data_type)) {
             c0 = m_b.makeIntConstant(0);
+        } else if (load_data_type == DataType::UINT32 && (sign_test == 1 || sign_test == 2)) {
+            // The sign tests on a 32-bit bitwise/unsigned result look at bit 31 of the result
+            // (the compiler tests a flag with "SHL.ltzero.u32 p0 reg 31"); an unsigned
+            // less-than-zero would never be true.
+            const spv::Id int_type = utils::make_vector_or_scalar_type(m_b, m_b.makeIntType(32), has_4_comp ? 4 : 1);
+            lhs = m_b.createUnaryOp(spv::OpBitcast, int_type, lhs);
+            c0 = m_b.makeIntConstant(0);
+            signed_zero_test = true;
         } else if (is_unsigned_integer_data_type(load_data_type)) {
             c0 = m_b.makeUintConstant(0);
         }
@@ -319,6 +328,17 @@ spv::Id USSETranslatorVisitor::vtst_impl(Instruction inst, ExtPredicate pred, in
     if (lhs == spv::NoResult || rhs == spv::NoResult) {
         LOG_ERROR("Source not loaded (lhs: {}, rhs: {})", lhs, rhs);
         return spv::NoResult;
+    }
+
+    if (signed_zero_test) {
+        used_comp_op = tb_comp_ops[1][compare_include_equal][sign_test];
+    }
+    if (!is_sub_opcode(inst.opcode) && sign_test == 2 && !compare_include_equal) {
+        // Sony's listing (psp2shaderperf -disasm) of a psp2cgc program: "shl.poszero.u32 p0,
+        // pa0.x, 0x1f" (sign test 1) is the flag-set test and "shl.negzero.u32" (sign test 2)
+        // the flag-clear test on the same register, so sign test 2 is "sign bit clear", zero
+        // included: >= 0, not > 0.
+        used_comp_op = tb_comp_ops[signed_zero_test ? 1 : index_tb_comp][1][sign_test];
     }
 
     return m_b.createOp(used_comp_op, pred_type, { lhs, rhs });
@@ -475,15 +495,52 @@ bool USSETranslatorVisitor::vtstmsk(
     // input is always 4 in case of a dot product instruction
     const bool is_vdp = (inst.opcode == Opcode::VDP || inst.opcode == Opcode::VF16DP);
     const bool output_4 = (alu_sel == 0 && tst_mask_type == 2);
+    // Mask type 0 on the vector ALU: one byte per component of the four-wide test, packed
+    // into the destination register (psp2cgc: "add.nezero.f32 o6.x, -pa2.xyzw, sa6.xxxx"
+    // followed by a test of bit 8 of o6, the y component's byte).
+    const bool byte_mask_4 = (alu_sel == 0 && tst_mask_type == 0 && !is_vdp && load_data_type == DataType::F32);
 
-    spv::Id pred_result = vtst_impl(inst, pred, zero_test, sign_test, (is_vdp || output_4) ? 0b1111 : 0b1, true);
+    // The instruction repeats like the others; the operand increments come from SMLSI,
+    // the second source keeping its register (Sony's listing of a repeated "cmp.eq.u8
+    // pa0.x, o4.x, sa21.x" shows pa1, o5 and sa21 again for the second iteration).
+    const Instruction base_inst = inst;
+    set_repeat_multiplier(1, 1, 1, 1);
+    BEGIN_REPEAT(rpt_count)
+    inst = base_inst;
+    inst.opr.dest.num += repeat_increase[3][current_repeat];
+    inst.opr.src1.num += repeat_increase[1][current_repeat];
+
+    spv::Id pred_result = vtst_impl(inst, pred, zero_test, sign_test, (is_vdp || output_4 || byte_mask_4) ? 0b1111 : 0b1, true);
+
+    if (byte_mask_4) {
+        const spv::Id u32_type = m_b.makeUintType(32);
+        spv::Id packed = m_b.makeUintConstant(0);
+        for (int comp = 0; comp < 4; comp++) {
+            const spv::Id cond = m_b.createCompositeExtract(pred_result, m_b.makeBoolType(), comp);
+            const spv::Id byte = m_b.createTriOp(spv::OpSelect, u32_type, cond, m_b.makeUintConstant(0xFFu << (8 * comp)), m_b.makeUintConstant(0));
+            packed = m_b.createBinOp(spv::OpBitwiseOr, u32_type, packed, byte);
+        }
+        inst.opr.dest.type = DataType::UINT32;
+        store(inst.opr.dest, packed);
+        continue;
+    }
 
     spv::Id output_type;
     spv::Id zeros;
     spv::Id ones;
     switch (load_data_type) {
-    case DataType::F16:
     case DataType::F32:
+        // The mask is a bitmask, all ones for true, not the float 1.0: the compiler follows
+        // "VADD.nezero.f32.f32 o6.x ..." with "SHL.ltzero.u32 i0.x o6.x 23", a test of bit 8
+        // of the result, which 0x3f800000 never has set.
+        output_type = m_b.makeUintType(32);
+        if (output_4)
+            output_type = m_b.makeVectorType(output_type, 4);
+        zeros = utils::make_uniform_vector_from_type(m_b, output_type, 0u);
+        ones = utils::make_uniform_vector_from_type(m_b, output_type, 0xFFFFFFFFu);
+        inst.opr.dest.type = DataType::UINT32;
+        break;
+    case DataType::F16:
         output_type = type_f32;
         if (output_4)
             output_type = m_b.makeVectorType(output_type, 4);
@@ -529,6 +586,8 @@ bool USSETranslatorVisitor::vtstmsk(
     pred_result = m_b.createOp(spv::OpSelect, output_type, { pred_result, ones, zeros });
 
     store(inst.opr.dest, pred_result);
+    END_REPEAT()
+    reset_repeat_multiplier();
 
     return true;
 }
