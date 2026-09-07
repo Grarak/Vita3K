@@ -835,19 +835,22 @@ EXPORT(int, _sceKernelWaitSignalCB, uint32_t unknown, uint32_t delay, uint32_t t
 }
 
 static int wait_thread_end(ThreadStatePtr &waiter, ThreadStatePtr &target, int *stat) {
-    std::unique_lock<std::mutex> waiter_lock(waiter->mutex);
-    {
-        const std::unique_lock<std::mutex> thread_lock(target->mutex);
-        if (target->status == ThreadStatus::dormant) {
-            if (stat != nullptr) {
-                *stat = target->returned_value;
-            }
-            return 0;
+    // Lock order is target then waiter, the same order raise_waiting_threads uses (it runs
+    // under the target's mutex and takes each waiter's), so the waiter's status can be
+    // flipped under the waiter's own mutex: a thread that exits between this registration
+    // and the wait below otherwise notifies before the waiter sleeps and the join never
+    // returns (azahar's AM scan worker, 2026-09-07).
+    std::unique_lock<std::mutex> target_lock(target->mutex);
+    if (target->status == ThreadStatus::dormant) {
+        if (stat != nullptr) {
+            *stat = target->returned_value;
         }
-
-        waiter->update_status(ThreadStatus::wait);
-        target->waiting_threads.push_back(waiter);
+        return 0;
     }
+    std::unique_lock<std::mutex> waiter_lock(waiter->mutex);
+    waiter->update_status(ThreadStatus::wait);
+    target->waiting_threads.push_back(waiter);
+    target_lock.unlock();
     waiter->status_cond.wait(waiter_lock, [&]() { return waiter->status == ThreadStatus::run; });
     return 0;
 }
