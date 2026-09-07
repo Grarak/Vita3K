@@ -27,9 +27,14 @@
 #include <dynarmic/interface/A32/coprocessor.h>
 #include <dynarmic/interface/exclusive_monitor.h>
 
+#include <cstdio>
+#include <cstdlib>
+#include <deque>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 
 class ArmDynarmicCP15 : public Dynarmic::A32::Coprocessor {
     uint32_t tpidruro;
@@ -122,18 +127,88 @@ public:
     }
 };
 
+// VITA3K_PROFILE=1: count, per guest thread, the instructions executed per translated block,
+// and write <thread id>.txt under ~/.local/share/Vita3K/profile/ every so often (the process
+// is usually killed, so nothing waits for exit). Instructions, not time: HLE'd calls cost
+// nothing here, so it ranks the guest's own code. One host call per block executed.
+struct ProfileBlock {
+    uint32_t pc = 0;
+    uint64_t insts = 0; ///< instructions retired in this block, all runs
+    uint64_t hits = 0;
+};
+
 class ArmDynarmicCallback : public Dynarmic::A32::UserCallbacks {
     friend class DynarmicCPU;
 
     CPUState *parent;
     DynarmicCPU *cpu;
 
+    // Counted at block exit: AddTicks reports the instructions of the block that just ran,
+    // and the pc at the previous exit is where that block began. Nothing is injected into
+    // the translated code, so an IT-block skip (a block dynarmic starts at a conditional
+    // instruction that fails, empty but for whatever the hook added) cannot turn into an
+    // empty block linked to itself - which is what a host call at the block's first
+    // instruction did.
+    std::deque<ProfileBlock> profile_blocks;
+    std::unordered_map<uint32_t, ProfileBlock *> profile_by_pc;
+    uint64_t profile_hits_since_dump = 0;
+    uint32_t profile_prev_pc = 0;
+
+    static bool profiling() {
+        static const bool on = std::getenv("VITA3K_PROFILE") != nullptr;
+        return on;
+    }
+
+    void CountTicks(uint64_t ticks) {
+        const uint32_t start = profile_prev_pc;
+        profile_prev_pc = cpu->jit->Regs()[15];
+        // A halt mid-run reports the whole budget as consumed; ignore those.
+        if (start == 0 || ticks > 1024)
+            return;
+        ProfileBlock *block;
+        auto it = profile_by_pc.find(start);
+        if (it == profile_by_pc.end()) {
+            profile_blocks.push_back(ProfileBlock{ start, 0, 0 });
+            block = &profile_blocks.back();
+            profile_by_pc.emplace(start, block);
+        } else {
+            block = it->second;
+        }
+        block->insts += ticks;
+        block->hits++;
+        if (++profile_hits_since_dump >= (1ull << 22)) {
+            profile_hits_since_dump = 0;
+            DumpProfile();
+        }
+    }
+
+    void DumpProfile() {
+        const char *home = std::getenv("HOME");
+        std::filesystem::path dir = std::filesystem::path(home ? home : ".") / ".local/share/Vita3K/profile";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        const auto path = dir / (std::to_string(parent->thread_id) + ".txt");
+        const auto tmp = dir / (std::to_string(parent->thread_id) + ".tmp");
+        FILE *f = std::fopen(tmp.string().c_str(), "w");
+        if (!f)
+            return;
+        for (const auto &b : profile_blocks) {
+            if (b.hits)
+                std::fprintf(f, "%08x %llu %llu\n", b.pc, (unsigned long long)b.insts, (unsigned long long)b.hits);
+        }
+        std::fclose(f);
+        std::filesystem::rename(tmp, path, ec);
+    }
+
 public:
     explicit ArmDynarmicCallback(CPUState &parent, DynarmicCPU &cpu)
         : parent(&parent)
         , cpu(&cpu) {}
 
-    ~ArmDynarmicCallback() override = default;
+    ~ArmDynarmicCallback() override {
+        if (profiling() && !profile_blocks.empty())
+            DumpProfile();
+    }
 
     std::optional<std::uint32_t> MemoryReadCode(Dynarmic::A32::VAddr addr) override {
         if (cpu->log_mem)
@@ -323,10 +398,15 @@ public:
         cpu->jit->HaltExecution(Dynarmic::HaltReason::UserDefined8);
     }
 
-    void AddTicks(uint64_t ticks) override {}
+    void AddTicks(uint64_t ticks) override {
+        if (profiling())
+            CountTicks(ticks);
+    }
 
     uint64_t GetTicksRemaining() override {
-        return 1ull << 60;
+        // Profiling: ticks are reported only when a run ends, so end one every few blocks;
+        // the exit pc of the previous run is where the next run's instructions are charged.
+        return profiling() ? 512 : (1ull << 60);
     }
 };
 
@@ -343,12 +423,11 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
         config.fastmem_pointer = std::bit_cast<uintptr_t>(parent->mem->memory.get());
     }
     config.hook_hint_instructions = true;
-    config.enable_cycle_counting = false;
+    config.enable_cycle_counting = std::getenv("VITA3K_PROFILE") != nullptr;
     config.global_monitor = &shared_monitor;
     config.coprocessors[15] = cp15;
     config.processor_id = core_id;
     config.optimizations = cpu_opt ? Dynarmic::all_safe_optimizations : Dynarmic::no_optimizations;
-    config.enable_cycle_counting = false;
 
     return std::make_unique<Dynarmic::A32::Jit>(config);
 }
